@@ -4,6 +4,7 @@ import json
 from django.contrib.auth import authenticate, login, logout
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.db.models import ProtectedError
 from django.forms import DateField, IntegerField, TimeField
 from django.http import JsonResponse
@@ -15,23 +16,35 @@ from django.views.decorators.http import require_http_methods
 from .forms import ReservaForm, VeiculoForm
 from .models import Reserva, Veiculo
 from .seguranca import login_obrigatorio
-from .services import veiculos_disponiveis
+from .services import CAPACIDADES, MAX_PASSAGEIROS, avisos_reserva, validar_periodo, veiculos_disponiveis
 
 MAX_TENTATIVAS = 5
 BLOQUEIO_SEGUNDOS = 300
+CODIGOS_CONFLITO = {"conflito_horario", "sem_veiculo_disponivel"}
 
 
 # ---------- utilitários ----------
 def _json(request):
     try:
         dados = json.loads(request.body or "{}")
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return dados if isinstance(dados, dict) else None
 
 
-def _erro(msg, status=400, erros=None):
-    return JsonResponse({"sucesso": False, "mensagem": msg, "erros": erros or {}}, status=status)
+def _erro(msg, status=400, erros=None, codigo=None):
+    corpo = {"sucesso": False, "mensagem": msg, "erros": erros or {}}
+    if codigo:
+        corpo["codigo"] = codigo
+    return JsonResponse(corpo, status=status)
+
+
+def _resposta_invalida(mensagem, form):
+    """400 para erro de validação; 409 quando há conflito de horário/disponibilidade."""
+    erros = form.errors.get_json_data()
+    codigos = {e["code"] for lista in erros.values() for e in lista}
+    status = 409 if codigos & CODIGOS_CONFLITO else 400
+    return _erro(mensagem, status=status, erros=erros)
 
 
 def _veiculo(v):
@@ -44,6 +57,7 @@ def _reserva(r):
         "id": r.id, "solicitante": r.solicitante, "setor": r.setor,
         "atividade": r.atividade, "origem": r.origem, "destino": r.destino,
         "data": r.data.isoformat(), "hora_saida": r.hora_saida.strftime("%H:%M"),
+        "data_retorno": r.data_fim.isoformat(),
         "hora_retorno": r.hora_retorno.strftime("%H:%M"),
         "passageiros": r.passageiros, "veiculo": _veiculo(r.veiculo),
         "categoria_pretendida": r.categoria_pretendida,
@@ -52,21 +66,45 @@ def _reserva(r):
     }
 
 
+def _mesclar_reserva(r, dados):
+    """PUT/PATCH: o que não foi enviado continua como está (não troca veículo sozinho)."""
+    atual = {
+        "solicitante": r.solicitante, "setor": r.setor, "atividade": r.atividade,
+        "origem": r.origem, "destino": r.destino, "data": r.data.isoformat(),
+        "hora_saida": r.hora_saida.strftime("%H:%M:%S"),
+        "hora_retorno": r.hora_retorno.strftime("%H:%M:%S"),
+        "data_retorno": r.data_retorno.isoformat() if r.data_retorno else "",
+        "passageiros": r.passageiros, "veiculo": r.veiculo_id,
+        "categoria_pretendida": r.categoria_pretendida, "observacoes": r.observacoes,
+    }
+    if "veiculo" in dados and "categoria_pretendida" not in dados:
+        atual["categoria_pretendida"] = ""  # categoria antiga não vale para o veículo novo
+    atual.update(dados)
+    return atual
+
+
+def _mesclar_veiculo(v, dados):
+    atual = {"codigo": v.codigo, "categoria": v.categoria, "ativo": v.ativo}
+    atual.update(dados)
+    return atual
+
+
 def _negar_se_nao_coseg(request):
     if not request.user.is_staff:
-        return _erro("Acesso restrito ao COSEG.", status=403)
+        return _erro("Acesso restrito ao COSEG.", status=403, codigo="sem_permissao")
     return None
 
 
 def _negar_se_alheia(request, reserva):
     if request.user.is_staff or reserva.criado_por_id == request.user.id:
         return None
-    return _erro("Você só pode acessar as suas próprias reservas.", status=403)
+    return _erro("Você só pode acessar as suas próprias reservas.", status=403, codigo="sem_permissao")
 
 
 # ---------- AUTENTICAÇÃO ----------
 def csrf_falhou(request, reason=""):
-    return _erro("Falha de CSRF: envie o cabeçalho X-CSRFToken (obtenha em /api/csrf/).", status=403)
+    return _erro("Falha de CSRF: envie o cabeçalho X-CSRFToken (obtenha em /api/csrf/).",
+                 status=403, codigo="csrf")
 
 
 @ensure_csrf_cookie
@@ -126,13 +164,13 @@ def veiculos_lista(request):
         return _erro("JSON inválido.")
     form = VeiculoForm(dados)
     if not form.is_valid():
-        return _erro("Dados inválidos.", erros=form.errors.get_json_data())
+        return _resposta_invalida("Dados inválidos.", form)
     v = form.save()
     return JsonResponse({"sucesso": True, "mensagem": "Veículo cadastrado.", "veiculo": _veiculo(v)}, status=201)
 
 
 @login_obrigatorio
-@require_http_methods(["GET", "PUT", "DELETE"])
+@require_http_methods(["GET", "PUT", "PATCH", "DELETE"])
 def veiculo_detalhe(request, pk):
     v = get_object_or_404(Veiculo, pk=pk)
     if request.method == "GET":
@@ -141,18 +179,18 @@ def veiculo_detalhe(request, pk):
     negado = _negar_se_nao_coseg(request)
     if negado is not None:
         return negado
-    if request.method == "PUT":
+    if request.method in ("PUT", "PATCH"):
         dados = _json(request)
         if dados is None:
             return _erro("JSON inválido.")
-        form = VeiculoForm(dados, instance=v)
+        form = VeiculoForm(_mesclar_veiculo(v, dados), instance=v)
         if not form.is_valid():
-            return _erro("Dados inválidos.", erros=form.errors.get_json_data())
+            return _resposta_invalida("Dados inválidos.", form)
         return JsonResponse({"sucesso": True, "mensagem": "Veículo atualizado.", "veiculo": _veiculo(form.save())})
     try:
         v.delete()
     except ProtectedError:
-        return _erro("Veículo possui reservas; desative-o em vez de excluir.", status=409)
+        return _erro("Veículo possui reservas; desative-o em vez de excluir.", status=409, codigo="veiculo_com_reservas")
     return JsonResponse({"sucesso": True, "mensagem": "Veículo removido."})
 
 
@@ -168,7 +206,7 @@ def reservas_lista(request):
             try:
                 qs = qs.filter(data=DateField().clean(request.GET["data"]))
             except ValidationError:
-                return _erro("Data inválida. Use o formato AAAA-MM-DD.")
+                return _erro("Data inválida. Use o formato AAAA-MM-DD.", codigo="data_invalida")
         if request.GET.get("veiculo"):
             qs = qs.filter(veiculo__codigo=request.GET["veiculo"])
         return JsonResponse({"reservas": [_reserva(r) for r in qs]})
@@ -176,17 +214,20 @@ def reservas_lista(request):
     dados = _json(request)
     if dados is None:
         return _erro("JSON inválido.")
-    form = ReservaForm(dados)
-    if not form.is_valid():
-        return _erro("Não foi possível registrar a reserva.", erros=form.errors.get_json_data())
-    r = form.save(commit=False)
-    r.criado_por = request.user
-    r.save()
-    return JsonResponse({"sucesso": True, "mensagem": "Reserva registrada com sucesso.", "reserva": _reserva(r)}, status=201)
+    # validação + gravação na MESMA transação (evita duas reservas simultâneas no mesmo horário)
+    with transaction.atomic():
+        form = ReservaForm(dados)
+        if not form.is_valid():
+            return _resposta_invalida("Não foi possível registrar a reserva.", form)
+        r = form.save(commit=False)
+        r.criado_por = request.user
+        r.save()
+    return JsonResponse({"sucesso": True, "mensagem": "Reserva registrada com sucesso.",
+                         "reserva": _reserva(r), "avisos": avisos_reserva(r)}, status=201)
 
 
 @login_obrigatorio
-@require_http_methods(["GET", "PUT", "DELETE"])
+@require_http_methods(["GET", "PUT", "PATCH", "DELETE"])
 def reserva_detalhe(request, pk):
     r = get_object_or_404(Reserva.objects.select_related("veiculo", "criado_por"), pk=pk)
     negado = _negar_se_alheia(request, r)
@@ -195,17 +236,23 @@ def reserva_detalhe(request, pk):
 
     if request.method == "GET":
         return JsonResponse(_reserva(r))
-    if request.method == "PUT":
+
+    if request.method in ("PUT", "PATCH"):
+        if r.status == Reserva.Status.CANCELADA:
+            return _erro("Reserva cancelada não pode ser editada.", status=409, codigo="reserva_cancelada")
         dados = _json(request)
         if dados is None:
             return _erro("JSON inválido.")
-        form = ReservaForm(dados, instance=r)
-        if not form.is_valid():
-            return _erro("Não foi possível atualizar a reserva.", erros=form.errors.get_json_data())
-        return JsonResponse({"sucesso": True, "mensagem": "Reserva atualizada.", "reserva": _reserva(form.save())})
+        with transaction.atomic():
+            form = ReservaForm(_mesclar_reserva(r, dados), instance=r)
+            if not form.is_valid():
+                return _resposta_invalida("Não foi possível atualizar a reserva.", form)
+            r = form.save()
+        return JsonResponse({"sucesso": True, "mensagem": "Reserva atualizada.",
+                             "reserva": _reserva(r), "avisos": avisos_reserva(r)})
 
     if not request.user.is_staff:
-        return _erro("Somente o COSEG exclui reservas. Use /cancelar/.", status=403)
+        return _erro("Somente o COSEG exclui reservas. Use /cancelar/.", status=403, codigo="sem_permissao")
     r.delete()
     return JsonResponse({"sucesso": True, "mensagem": "Reserva excluída."})
 
@@ -217,8 +264,10 @@ def reserva_cancelar(request, pk):
     negado = _negar_se_alheia(request, r)
     if negado is not None:
         return negado
-    r.status = Reserva.Status.CANCELADA
-    r.save()
+    try:
+        r.cancelar()
+    except ValidationError:
+        return _erro("Esta reserva já está cancelada.", status=409, codigo="ja_cancelada")
     return JsonResponse({"sucesso": True, "mensagem": "Reserva cancelada; veículo liberado."})
 
 
@@ -226,14 +275,37 @@ def reserva_cancelar(request, pk):
 @login_obrigatorio
 @require_http_methods(["GET"])
 def disponibilidade(request):
-    try:
-        data = DateField().clean(request.GET.get("data"))
-        saida = TimeField().clean(request.GET.get("saida"))
-        retorno = TimeField().clean(request.GET.get("retorno"))
-        pax = IntegerField(min_value=1).clean(request.GET.get("passageiros"))
-    except ValidationError:
-        return _erro("Informe data, saida, retorno e passageiros válidos.")
-    if retorno <= saida:
-        return _erro("O horário de retorno deve ser posterior ao de saída.")
-    qs = veiculos_disponiveis(data, saida, retorno, pax, request.GET.get("categoria") or None)
+    q = request.GET
+    campos = {
+        "data": DateField(),
+        "saida": TimeField(),
+        "retorno": TimeField(),
+        "data_retorno": DateField(required=False),
+        "passageiros": IntegerField(min_value=1, max_value=MAX_PASSAGEIROS),
+    }
+    valores, erros = {}, {}
+    for nome, campo in campos.items():
+        try:
+            valores[nome] = campo.clean(q.get(nome))
+        except ValidationError as e:
+            erros[nome] = [{"message": err.messages[0], "code": err.code or "invalido"}
+                           for err in e.error_list]
+
+    categoria = (q.get("categoria") or "").strip().upper() or None
+    if categoria and categoria not in CAPACIDADES:
+        erros["categoria"] = [{"message": "Categoria inexistente. Use LEVE ou COLETIVO.",
+                               "code": "categoria_invalida"}]
+
+    if not any(k in erros for k in ("data", "saida", "retorno", "data_retorno")):
+        for campo, codigo, msg in validar_periodo(
+            valores["data"], valores["saida"], valores["retorno"], valores["data_retorno"]
+        ):
+            nome = {"hora_saida": "saida", "hora_retorno": "retorno"}.get(campo, campo)
+            erros.setdefault(nome, []).append({"message": msg, "code": codigo})
+
+    if erros:
+        return _erro("Parâmetros inválidos.", erros=erros)
+
+    qs = veiculos_disponiveis(valores["data"], valores["saida"], valores["retorno"],
+                              valores["passageiros"], categoria, valores["data_retorno"])
     return JsonResponse({"disponiveis": [_veiculo(v) for v in qs]})

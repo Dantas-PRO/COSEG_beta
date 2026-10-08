@@ -1,8 +1,8 @@
 from django import forms
-from django.utils import timezone
+from django.core.exceptions import ValidationError
 
-from .models import CAPACIDADES, Reserva, Veiculo
-from .services import reservas_conflitantes, veiculos_disponiveis
+from .models import Reserva, Veiculo
+from .services import CAPACIDADES, MAX_PASSAGEIROS, travar_veiculos, validar_periodo, veiculos_disponiveis
 
 
 class VeiculoForm(forms.ModelForm):
@@ -12,9 +12,8 @@ class VeiculoForm(forms.ModelForm):
 
 
 class ReservaForm(forms.ModelForm):
-    veiculo = forms.ModelChoiceField(
-        queryset=Veiculo.objects.filter(ativo=True), required=False
-    )
+    # queryset com TODOS os veículos: quem diz se o inativo pode ou não é o model
+    veiculo = forms.ModelChoiceField(queryset=Veiculo.objects.all(), required=False)
     categoria_pretendida = forms.ChoiceField(
         choices=Veiculo.Categoria.choices, required=False
     )
@@ -23,65 +22,41 @@ class ReservaForm(forms.ModelForm):
         model = Reserva
         fields = [
             "solicitante", "setor", "atividade", "origem", "destino",
-            "data", "hora_saida", "hora_retorno", "passageiros",
+            "data", "hora_saida", "data_retorno", "hora_retorno", "passageiros",
             "veiculo", "categoria_pretendida", "observacoes",
         ]
 
     def clean(self):
         dados = super().clean()
-        data = dados.get("data")
-        saida = dados.get("hora_saida")
-        retorno = dados.get("hora_retorno")
-        pax = dados.get("passageiros")
         veiculo = dados.get("veiculo")
         categoria = dados.get("categoria_pretendida")
 
-        # Data e horários
-        if data and data < timezone.localdate():
-            self.add_error("data", "A data não pode estar no passado.")
-        if saida and retorno and retorno <= saida:
-            self.add_error("hora_retorno", "O horário de retorno deve ser posterior ao de saída.")
-
-        # Capacidade
-        if pax is not None:
-            if pax < 1:
-                self.add_error("passageiros", "Informe ao menos 1 passageiro.")
-            elif pax > 18:
-                self.add_error("passageiros", "Solicitação rejeitada: máximo de 18 passageiros.")
-            elif veiculo and pax > veiculo.capacidade:
-                self.add_error(
-                    "passageiros",
-                    f"O veículo {veiculo.codigo} comporta {veiculo.capacidade} passageiros "
-                    f"e foram solicitados {pax}.",
-                )
-            elif categoria and pax > CAPACIDADES[categoria]:
-                self.add_error(
-                    "passageiros",
-                    f"A categoria {categoria} comporta {CAPACIDADES[categoria]} passageiros. "
-                    "Escolha a categoria COLETIVO.",
-                )
-
-        if not veiculo and not categoria:
-            self.add_error(None, "Informe o veículo ou a categoria pretendida.")
-
-        if self.errors:          # só consulta o banco se o resto estiver válido
+        if veiculo is None and not categoria and "veiculo" not in self.errors:
+            self.add_error(None, ValidationError(
+                "Informe o veículo ou a categoria pretendida.", code="veiculo_obrigatorio"))
             return dados
 
-        # Conflito de horários (consulta ao banco)
-        ignorar = self.instance.pk
-        if veiculo:
-            if reservas_conflitantes(veiculo, data, saida, retorno, ignorar).exists():
-                self.add_error(
-                    "veiculo",
-                    f"Conflito: {veiculo.codigo} já está reservado nesse intervalo.",
-                )
-        else:
-            escolhido = veiculos_disponiveis(data, saida, retorno, pax, categoria, ignorar).first()
-            if escolhido is None:
-                self.add_error(
-                    "categoria_pretendida",
-                    "Nenhum veículo dessa categoria está disponível no período.",
-                )
-            else:
-                dados["veiculo"] = escolhido   # atribuição automática
+        # Atribuição automática: só categoria informada
+        if veiculo is None and categoria and "veiculo" not in self.errors:
+            data = dados.get("data")
+            saida = dados.get("hora_saida")
+            retorno = dados.get("hora_retorno")
+            data_retorno = dados.get("data_retorno")
+            pax = dados.get("passageiros")
+            pronto = (
+                None not in (data, saida, retorno, pax)
+                and 1 <= pax <= CAPACIDADES[categoria]
+                and not validar_periodo(data, saida, retorno, data_retorno, checar_passado=False)
+            )
+            if pronto:
+                travar_veiculos()  # trava a frota até o fim da transação
+                escolhido = veiculos_disponiveis(
+                    data, saida, retorno, pax, categoria, data_retorno, self.instance.pk
+                ).first()
+                if escolhido is None:
+                    self.add_error("categoria_pretendida", ValidationError(
+                        "Nenhum veículo dessa categoria está disponível no período.",
+                        code="sem_veiculo_disponivel"))
+                else:
+                    dados["veiculo"] = escolhido
         return dados

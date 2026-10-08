@@ -142,3 +142,16 @@ if not DEBUG:   # só vale em produção (com HTTPS)
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_HSTS_SECONDS = 3600
+
+# ---------------- Correções de QA ----------------
+# Modo demonstração: libera datas passadas (use só para mostrar os dados do enunciado)
+COSEG_PERMITIR_DATA_PASSADA = os.environ.get("COSEG_PERMITIR_DATA_PASSADA", "False") == "True"
+
+# SQLite: cada transação de escrita começa já com o bloqueio (evita reservas simultâneas
+# passarem juntas pela checagem de conflito)
+DATABASES["default"].setdefault("OPTIONS", {}).update(
+    {"transaction_mode": "IMMEDIATE", "timeout": 20}
+)
+
+# Erros 404/405/500 sob /api/ passam a responder em JSON
+MIDDLEWARE.insert(0, "reservas.middleware.ApiJsonErrorsMiddleware")
