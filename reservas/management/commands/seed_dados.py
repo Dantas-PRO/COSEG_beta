@@ -21,11 +21,13 @@ class Command(BaseCommand):
             ("VL-05", date(2026, 8, 20), time(14), time(17), "Visita externa", 4),
         ]
         for cod, d, s, r, ativ, pax in iniciais:
-            # grava direto pelo ORM (sem a validação de "data no passado")
-            Reserva.objects.get_or_create(
-                veiculo=Veiculo.objects.get(codigo=cod), data=d, hora_saida=s,
-                defaults=dict(solicitante="COSEG (carga inicial)", setor="COSEG",
-                              atividade=ativ, origem="Porto do Itaqui", destino="A definir",
-                              hora_retorno=r, passageiros=pax),
-            )
+            veiculo = Veiculo.objects.get(codigo=cod)
+            if Reserva.objects.filter(veiculo=veiculo, data=d, hora_saida=s).exists():
+                continue
+            # Carga histórica do enunciado (datas já passadas): bypass explícito da validação.
+            Reserva(
+                veiculo=veiculo, data=d, hora_saida=s, hora_retorno=r,
+                solicitante="COSEG (carga inicial)", setor="COSEG", atividade=ativ,
+                origem="Porto do Itaqui", destino="A definir", passageiros=pax,
+            ).save(validar=False)
         self.stdout.write(self.style.SUCCESS("Dados iniciais carregados."))

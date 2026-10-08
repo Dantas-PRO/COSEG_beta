@@ -22,6 +22,13 @@ MAX_TENTATIVAS = 5
 BLOQUEIO_SEGUNDOS = 300
 CODIGOS_CONFLITO = {"conflito_horario", "sem_veiculo_disponivel"}
 
+TEXTOS_RESERVA = ("solicitante", "setor", "atividade", "origem", "destino", "observacoes",
+                  "categoria_pretendida", "data", "hora_saida", "data_retorno", "hora_retorno")
+INTEIROS_RESERVA = ("passageiros", "veiculo")
+TEXTOS_VEICULO = ("codigo", "categoria")
+BOOLEANOS_VEICULO = ("ativo",)
+LIMITE_INT = 2 ** 31
+
 
 # ---------- utilitários ----------
 def _json(request):
@@ -39,12 +46,58 @@ def _erro(msg, status=400, erros=None, codigo=None):
     return JsonResponse(corpo, status=status)
 
 
-def _resposta_invalida(mensagem, form):
+def _tipos_invalidos(dados, textos=(), inteiros=(), booleanos=()):
+    """Recusa lista, objeto, número ou booleano onde se espera outro tipo."""
+    erros = {}
+
+    def marcar(campo, esperado, codigo="tipo_invalido"):
+        erros[campo] = [{"message": f"Tipo inválido para '{campo}': envie {esperado}.",
+                         "code": codigo}]
+
+    for c in textos:
+        v = dados.get(c)
+        if v is not None and not isinstance(v, str):
+            marcar(c, "um texto")
+    for c in inteiros:
+        v = dados.get(c)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, str)):
+            marcar(c, "um número inteiro")
+        elif isinstance(v, int) and not (-LIMITE_INT < v < LIMITE_INT):
+            marcar(c, "um número inteiro dentro do limite", "valor_invalido")
+    for c in booleanos:
+        v = dados.get(c)
+        if v is not None and not isinstance(v, (bool, str)):
+            marcar(c, "verdadeiro ou falso")
+    return erros
+
+
+def _negar_tipos(erros):
+    if erros:
+        return _erro("Tipos de dados inválidos.", erros=erros)
+    return None
+
+
+def _erros_de_validacao(exc):
+    """ValidationError do Django -> mesmo formato do form.errors.get_json_data()."""
+    def item(e):
+        return {"message": e.messages[0], "code": e.code or "invalido"}
+
+    if hasattr(exc, "error_dict"):
+        return {campo: [item(e) for e in lista] for campo, lista in exc.error_dict.items()}
+    return {"__all__": [item(e) for e in exc.error_list]}
+
+
+def _resposta_de_erros(mensagem, erros):
     """400 para erro de validação; 409 quando há conflito de horário/disponibilidade."""
-    erros = form.errors.get_json_data()
     codigos = {e["code"] for lista in erros.values() for e in lista}
     status = 409 if codigos & CODIGOS_CONFLITO else 400
     return _erro(mensagem, status=status, erros=erros)
+
+
+def _resposta_invalida(mensagem, form):
+    return _resposta_de_erros(mensagem, form.errors.get_json_data())
 
 
 def _veiculo(v):
@@ -162,10 +215,17 @@ def veiculos_lista(request):
     dados = _json(request)
     if dados is None:
         return _erro("JSON inválido.")
-    form = VeiculoForm(dados)
-    if not form.is_valid():
-        return _resposta_invalida("Dados inválidos.", form)
-    v = form.save()
+    negado = _negar_tipos(_tipos_invalidos(dados, TEXTOS_VEICULO, booleanos=BOOLEANOS_VEICULO))
+    if negado is not None:
+        return negado
+    dados.setdefault("ativo", True)
+    try:
+        form = VeiculoForm(dados)
+        if not form.is_valid():
+            return _resposta_invalida("Dados inválidos.", form)
+        v = form.save()
+    except ValidationError as exc:
+        return _resposta_de_erros("Dados inválidos.", _erros_de_validacao(exc))
     return JsonResponse({"sucesso": True, "mensagem": "Veículo cadastrado.", "veiculo": _veiculo(v)}, status=201)
 
 
@@ -183,10 +243,17 @@ def veiculo_detalhe(request, pk):
         dados = _json(request)
         if dados is None:
             return _erro("JSON inválido.")
-        form = VeiculoForm(_mesclar_veiculo(v, dados), instance=v)
-        if not form.is_valid():
-            return _resposta_invalida("Dados inválidos.", form)
-        return JsonResponse({"sucesso": True, "mensagem": "Veículo atualizado.", "veiculo": _veiculo(form.save())})
+        negado = _negar_tipos(_tipos_invalidos(dados, TEXTOS_VEICULO, booleanos=BOOLEANOS_VEICULO))
+        if negado is not None:
+            return negado
+        try:
+            form = VeiculoForm(_mesclar_veiculo(v, dados), instance=v)
+            if not form.is_valid():
+                return _resposta_invalida("Dados inválidos.", form)
+            v = form.save()
+        except ValidationError as exc:
+            return _resposta_de_erros("Dados inválidos.", _erros_de_validacao(exc))
+        return JsonResponse({"sucesso": True, "mensagem": "Veículo atualizado.", "veiculo": _veiculo(v)})
     try:
         v.delete()
     except ProtectedError:
@@ -214,14 +281,20 @@ def reservas_lista(request):
     dados = _json(request)
     if dados is None:
         return _erro("JSON inválido.")
+    negado = _negar_tipos(_tipos_invalidos(dados, TEXTOS_RESERVA, INTEIROS_RESERVA))
+    if negado is not None:
+        return negado
     # validação + gravação na MESMA transação (evita duas reservas simultâneas no mesmo horário)
-    with transaction.atomic():
-        form = ReservaForm(dados)
-        if not form.is_valid():
-            return _resposta_invalida("Não foi possível registrar a reserva.", form)
-        r = form.save(commit=False)
-        r.criado_por = request.user
-        r.save()
+    try:
+        with transaction.atomic():
+            form = ReservaForm(dados)
+            if not form.is_valid():
+                return _resposta_invalida("Não foi possível registrar a reserva.", form)
+            r = form.save(commit=False)
+            r.criado_por = request.user
+            r.save()
+    except ValidationError as exc:
+        return _resposta_de_erros("Não foi possível registrar a reserva.", _erros_de_validacao(exc))
     return JsonResponse({"sucesso": True, "mensagem": "Reserva registrada com sucesso.",
                          "reserva": _reserva(r), "avisos": avisos_reserva(r)}, status=201)
 
@@ -243,11 +316,17 @@ def reserva_detalhe(request, pk):
         dados = _json(request)
         if dados is None:
             return _erro("JSON inválido.")
-        with transaction.atomic():
-            form = ReservaForm(_mesclar_reserva(r, dados), instance=r)
-            if not form.is_valid():
-                return _resposta_invalida("Não foi possível atualizar a reserva.", form)
-            r = form.save()
+        negado = _negar_tipos(_tipos_invalidos(dados, TEXTOS_RESERVA, INTEIROS_RESERVA))
+        if negado is not None:
+            return negado
+        try:
+            with transaction.atomic():
+                form = ReservaForm(_mesclar_reserva(r, dados), instance=r)
+                if not form.is_valid():
+                    return _resposta_invalida("Não foi possível atualizar a reserva.", form)
+                r = form.save()
+        except ValidationError as exc:
+            return _resposta_de_erros("Não foi possível atualizar a reserva.", _erros_de_validacao(exc))
         return JsonResponse({"sucesso": True, "mensagem": "Reserva atualizada.",
                              "reserva": _reserva(r), "avisos": avisos_reserva(r)})
 

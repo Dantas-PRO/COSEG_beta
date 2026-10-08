@@ -4,6 +4,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 
@@ -17,6 +18,7 @@ def codigos(resposta):
     return {e["code"] for lista in resposta.json()["erros"].values() for e in lista}
 
 
+@override_settings(COSEG_PERMITIR_DATA_PASSADA=False)  # testes não dependem do .env
 class BaseAPI(TestCase):
     def setUp(self):
         cache.clear()
@@ -151,11 +153,12 @@ class ReservaAPITests(BaseAPI):
 
     def _reserva_no_passado(self):
         self.passado = timezone.localdate() - timedelta(days=10)
-        Reserva.objects.create(
+        # carga histórica: bypass explícito da validação (como o seed_dados)
+        Reserva(
             solicitante="COSEG", setor="COSEG", atividade="Reunião administrativa",
             origem="Itaqui", destino="X", data=self.passado,
             hora_saida=time(8), hora_retorno=time(10), passageiros=3, veiculo=self.vl,
-        )
+        ).save(validar=False)
 
     def test_conflito_em_data_passada_mostra_os_dois_erros(self):
         self._reserva_no_passado()
@@ -238,6 +241,42 @@ class ReservaAPITests(BaseAPI):
         r = self.post({"passageiros": "abc", "veiculo": {"a": 1}, "data": [1]})
         self.assertEqual(r.status_code, 400)
 
+    def test_tipos_errados_no_cadastro(self):
+        ruins = [[], [1], {}, {"a": 1}, 123, 1.5, True]
+        for campo in ("data", "hora_saida", "data_retorno", "hora_retorno"):
+            for ruim in ruins:
+                r = self.post(self.dados(**{campo: ruim}))
+                self.assertEqual(r.status_code, 400, (campo, ruim))
+                self.assertIn("tipo_invalido", codigos(r))
+        for campo in ("passageiros", "veiculo"):
+            for ruim in ([], {"a": 1}, True, 1.5):
+                r = self.post(self.dados(**{campo: ruim}))
+                self.assertEqual(r.status_code, 400, (campo, ruim))
+        self.assertEqual(Reserva.objects.count(), 0)
+
+    def test_tipos_errados_na_edicao(self):
+        pk = self.post(self.dados()).json()["reserva"]["id"]
+        for campo in ("data", "hora_saida", "data_retorno", "hora_retorno"):
+            for ruim in ([], [1], {"a": 1}, 123, True):
+                for metodo in (self.put, self.c.patch):
+                    if metodo == self.put:
+                        r = self.put(f"/api/reservas/{pk}/", {campo: ruim})
+                    else:
+                        r = self.c.patch(f"/api/reservas/{pk}/", json.dumps({campo: ruim}),
+                                         content_type=JSON)
+                    self.assertEqual(r.status_code, 400, (campo, ruim))
+                    self.assertIn("tipo_invalido", codigos(r))
+
+    def test_tipos_errados_em_veiculo(self):
+        for corpo in [{"codigo": [1], "categoria": "LEVE"},
+                      {"codigo": "ZZ-1", "categoria": {"a": 1}},
+                      {"codigo": "ZZ-1", "categoria": "LEVE", "ativo": [1]},
+                      {"codigo": 123, "categoria": "LEVE"},
+                      {"codigo": "ZZ-1", "categoria": "XYZ"}]:
+            r = self.c.post("/api/veiculos/", json.dumps(corpo), content_type=JSON)
+            self.assertEqual(r.status_code, 400, corpo)
+        self.assertFalse(Veiculo.objects.filter(codigo="ZZ-1").exists())
+
     def test_disponibilidade_valida(self):
         r = self.c.get("/api/disponibilidade/", {
             "data": self.dia.isoformat(), "saida": "08:00", "retorno": "10:00", "passageiros": 3})
@@ -258,6 +297,55 @@ class ReservaAPITests(BaseAPI):
         r = self.c.get("/api/disponibilidade/", {
             "data": self.dia.isoformat(), "saida": "08:00", "retorno": "10:00", "passageiros": 0})
         self.assertEqual(r.status_code, 400)
+
+
+class ORMTests(BaseAPI):
+    """As regras valem também para quem grava direto pelo ORM."""
+
+    def campos(self, **extra):
+        base = dict(solicitante="X", setor="Y", atividade="Z", origem="A", destino="B",
+                    data=self.dia, hora_saida=time(8), hora_retorno=time(10),
+                    passageiros=3, veiculo=self.vl)
+        base.update(extra)
+        return base
+
+    def test_orm_aplica_as_regras(self):
+        with self.assertRaises(ValidationError) as ctx:
+            Reserva.objects.create(**self.campos(
+                data=date(2020, 1, 1), hora_saida=time(10), hora_retorno=time(9), passageiros=50))
+        self.assertTrue({"data", "hora_retorno", "passageiros"} <= set(ctx.exception.message_dict))
+        self.assertEqual(Reserva.objects.count(), 0)
+
+    def test_orm_aceita_dados_validos_e_barra_conflito(self):
+        r = Reserva.objects.create(**self.campos(
+            data=self.dia.isoformat(), hora_saida="08:00", hora_retorno="10:00"))
+        self.assertEqual(r.data, self.dia)  # texto convertido para data
+        with self.assertRaises(ValidationError) as ctx:
+            Reserva.objects.create(**self.campos(hora_saida=time(9), hora_retorno=time(11)))
+        self.assertIn("conflito_horario", {e.code for e in ctx.exception.error_dict["veiculo"]})
+        self.assertEqual(Reserva.objects.count(), 1)
+
+    def test_orm_tipos_errados_viram_validation_error(self):
+        casos = [("data", "abc"), ("data", [1]), ("data", 123), ("hora_saida", "xx"),
+                 ("hora_saida", [1]), ("hora_retorno", {"a": 1}), ("data_retorno", 123),
+                 ("passageiros", "abc"), ("passageiros", [1]), ("categoria_pretendida", [1])]
+        for campo, ruim in casos:
+            with self.assertRaises(ValidationError, msg=(campo, ruim)):
+                Reserva.objects.create(**self.campos(**{campo: ruim}))
+        self.assertEqual(Reserva.objects.count(), 0)
+
+    def test_orm_veiculo_categoria_inexistente(self):
+        with self.assertRaises(ValidationError):
+            Veiculo.objects.create(codigo="XX-01", categoria="XYZ")
+        with self.assertRaises(ValidationError):
+            Veiculo.objects.create(codigo="XX-02", categoria=[1])
+        with self.assertRaises(ValidationError):  # código duplicado: erro de validação, não IntegrityError
+            Veiculo.objects.create(codigo="VL-01", categoria="LEVE")
+        self.assertFalse(Veiculo.objects.filter(codigo__startswith="XX").exists())
+
+    def test_bypass_explicito_para_carga_inicial(self):
+        Reserva(**self.campos(data=date(2020, 1, 1))).save(validar=False)
+        self.assertEqual(Reserva.objects.count(), 1)
 
 
 class AdminTests(BaseAPI):

@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime, time
 
 from django.conf import settings
-from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
+from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -13,6 +13,17 @@ from .services import (
     travar_veiculos,
     validar_periodo,
 )
+
+# Tipos aceitos em cada campo da reserva (antes de qualquer conversão)
+_TIPOS_RESERVA = {
+    "data": (str, date),
+    "data_retorno": (str, date),
+    "hora_saida": (str, time),
+    "hora_retorno": (str, time),
+    "passageiros": (str, int),
+    "veiculo_id": (str, int),
+    "categoria_pretendida": (str,),
+}
 
 
 class Veiculo(models.Model):
@@ -27,7 +38,7 @@ class Veiculo(models.Model):
 
     def clean(self):
         # Não deixa reduzir a capacidade abaixo do que já foi reservado
-        if not self.pk or self.categoria not in CAPACIDADES:
+        if not self.pk or not isinstance(self.categoria, str) or self.categoria not in CAPACIDADES:
             return
         nova = CAPACIDADES[self.categoria]
         afetadas = list(self.reservas.filter(
@@ -45,9 +56,13 @@ class Veiculo(models.Model):
                 code="reservas_incompativeis",
             )})
 
-    def save(self, *args, **kwargs):
-        # a capacidade é derivada da categoria (regra de negócio no model)
-        self.capacidade = CAPACIDADES[self.categoria]
+    def save(self, *args, validar=True, **kwargs):
+        # a capacidade é derivada da categoria; categoria inválida vira erro de validação
+        self.capacidade = (
+            CAPACIDADES.get(self.categoria, 0) if isinstance(self.categoria, str) else 0
+        )
+        if validar:
+            self.full_clean(validate_constraints=False)
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -98,14 +113,55 @@ class Reserva(models.Model):
     def fim(self):
         return datetime.combine(self.data_fim, self.hora_retorno)
 
+    # ----- gravação -----
+    def save(self, *args, validar=True, **kwargs):
+        """Valida SEMPRE antes de gravar (ORM, API e admin passam pelas mesmas regras).
+        validar=False é um bypass explícito, usado só na carga inicial (seed) e no cancelamento."""
+        if validar:
+            self.full_clean(validate_constraints=False)
+        super().save(*args, **kwargs)
+
     def cancelar(self):
         if self.status == self.Status.CANCELADA:
             raise ValidationError("Esta reserva já está cancelada.", code="ja_cancelada")
         self.status = self.Status.CANCELADA
-        self.save(update_fields=["status"])
+        self.save(update_fields=["status"], validar=False)  # cancelar é sempre seguro
 
-    # ----- regras de negócio (valem para API E admin) -----
+    # ----- validação de tipos (evita TypeError/500 com lista, objeto, número...) -----
+    def clean_fields(self, exclude=None):
+        exclude = list(exclude or [])
+        erros = {}
+        for attname, tipos in _TIPOS_RESERVA.items():
+            campo = "veiculo" if attname == "veiculo_id" else attname
+            if campo in exclude:
+                continue
+            valor = getattr(self, attname)
+            if valor is not None and (isinstance(valor, bool) or not isinstance(valor, tipos)):
+                erros[campo] = [ValidationError(
+                    f"Tipo de dado inválido para o campo '{campo}'.", code="tipo_invalido")]
+                exclude.append(campo)
+        try:
+            super().clean_fields(exclude=exclude)
+        except ValidationError as e:
+            erros = e.update_error_dict(erros)
+        if erros:
+            raise ValidationError(erros)
+
+    def _tipos_validos(self):
+        return (
+            all(v is None or isinstance(v, date) for v in (self.data, self.data_retorno))
+            and all(v is None or isinstance(v, time) for v in (self.hora_saida, self.hora_retorno))
+            and (self.passageiros is None
+                 or (isinstance(self.passageiros, int) and not isinstance(self.passageiros, bool)))
+            and (self.veiculo_id is None or isinstance(self.veiculo_id, int))
+            and (self.categoria_pretendida is None or isinstance(self.categoria_pretendida, str))
+        )
+
+    # ----- regras de negócio (valem para API, admin E ORM) -----
     def clean(self):
+        if not self._tipos_validos():
+            return  # clean_fields já informou o campo com tipo/valor inválido
+
         erros = {}
 
         def add(campo, codigo, msg):
@@ -117,8 +173,11 @@ class Reserva(models.Model):
                 and self.status == self.Status.CANCELADA):
             raise ValidationError("Reserva cancelada não pode ser editada.", code="reserva_cancelada")
 
-        v = self.veiculo if self.veiculo_id else None
-        cat = self.categoria_pretendida
+        try:
+            v = self.veiculo if self.veiculo_id else None
+        except ObjectDoesNotExist:
+            v = None  # veículo inexistente: o erro vem do clean_fields
+        cat = self.categoria_pretendida or ""
 
         agenda_mudou = original is None or (
             original.veiculo_id, original.data, original.hora_saida,
@@ -148,7 +207,7 @@ class Reserva(models.Model):
                     add("passageiros", "capacidade_excedida",
                         f"O veículo {v.codigo} comporta {v.capacidade} passageiros "
                         f"e foram solicitados {pax}.")
-                if v is None and cat and pax > CAPACIDADES[cat]:
+                if v is None and cat in CAPACIDADES and pax > CAPACIDADES[cat]:
                     add("passageiros", "capacidade_excedida",
                         f"A categoria {cat} comporta {CAPACIDADES[cat]} passageiros. "
                         "Escolha a categoria COLETIVO.")
