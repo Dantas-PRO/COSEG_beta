@@ -1,22 +1,33 @@
+import hashlib
 import json
 
+from django.contrib.auth import authenticate, login, logout
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.db.models import ProtectedError
+from django.forms import DateField, IntegerField, TimeField
 from django.http import JsonResponse
+from django.middleware.csrf import get_token
 from django.shortcuts import get_object_or_404
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
 from .forms import ReservaForm, VeiculoForm
 from .models import Reserva, Veiculo
+from .seguranca import login_obrigatorio
 from .services import veiculos_disponiveis
-from django.forms import DateField, TimeField, IntegerField
+
+MAX_TENTATIVAS = 5
+BLOQUEIO_SEGUNDOS = 300
 
 
+# ---------- utilitários ----------
 def _json(request):
     try:
-        return json.loads(request.body or "{}")
-    except json.JSONDecodeError:
+        dados = json.loads(request.body or "{}")
+    except ValueError:
         return None
+    return dados if isinstance(dados, dict) else None
 
 
 def _erro(msg, status=400, erros=None):
@@ -37,15 +48,79 @@ def _reserva(r):
         "passageiros": r.passageiros, "veiculo": _veiculo(r.veiculo),
         "categoria_pretendida": r.categoria_pretendida,
         "observacoes": r.observacoes, "status": r.status,
+        "criado_por": r.criado_por.username if r.criado_por else None,
     }
 
 
+def _negar_se_nao_coseg(request):
+    if not request.user.is_staff:
+        return _erro("Acesso restrito ao COSEG.", status=403)
+    return None
+
+
+def _negar_se_alheia(request, reserva):
+    if request.user.is_staff or reserva.criado_por_id == request.user.id:
+        return None
+    return _erro("Você só pode acessar as suas próprias reservas.", status=403)
+
+
+# ---------- AUTENTICAÇÃO ----------
+def csrf_falhou(request, reason=""):
+    return _erro("Falha de CSRF: envie o cabeçalho X-CSRFToken (obtenha em /api/csrf/).", status=403)
+
+
+@ensure_csrf_cookie
+@require_http_methods(["GET"])
+def csrf(request):
+    return JsonResponse({"csrfToken": get_token(request)})
+
+
+@require_http_methods(["POST"])
+def login_view(request):
+    dados = _json(request)
+    if dados is None:
+        return _erro("JSON inválido.")
+    username = str(dados.get("username", "")).strip()
+    senha = str(dados.get("password", ""))
+
+    hash_user = hashlib.sha256(username.lower().encode()).hexdigest()[:16]
+    chave = f"login:{request.META.get('REMOTE_ADDR', '')}:{hash_user}"
+    if cache.get(chave, 0) >= MAX_TENTATIVAS:
+        return _erro("Muitas tentativas de login. Aguarde alguns minutos.", status=429)
+
+    user = authenticate(request, username=username, password=senha)
+    if user is None:
+        cache.set(chave, cache.get(chave, 0) + 1, BLOQUEIO_SEGUNDOS)
+        return _erro("Usuário ou senha inválidos.", status=401)
+
+    cache.delete(chave)
+    login(request, user)
+    return JsonResponse({"sucesso": True, "mensagem": "Login realizado.",
+                         "usuario": {"username": user.username, "coseg": user.is_staff}})
+
+
+@require_http_methods(["POST"])
+def logout_view(request):
+    logout(request)
+    return JsonResponse({"sucesso": True, "mensagem": "Sessão encerrada."})
+
+
+@login_obrigatorio
+@require_http_methods(["GET"])
+def eu(request):
+    return JsonResponse({"username": request.user.username, "coseg": request.user.is_staff})
+
+
 # ---------- VEÍCULOS ----------
-@csrf_exempt
+@login_obrigatorio
 @require_http_methods(["GET", "POST"])
 def veiculos_lista(request):
     if request.method == "GET":
         return JsonResponse({"veiculos": [_veiculo(v) for v in Veiculo.objects.all()]})
+
+    negado = _negar_se_nao_coseg(request)
+    if negado is not None:
+        return negado
     dados = _json(request)
     if dados is None:
         return _erro("JSON inválido.")
@@ -56,12 +131,16 @@ def veiculos_lista(request):
     return JsonResponse({"sucesso": True, "mensagem": "Veículo cadastrado.", "veiculo": _veiculo(v)}, status=201)
 
 
-@csrf_exempt
+@login_obrigatorio
 @require_http_methods(["GET", "PUT", "DELETE"])
 def veiculo_detalhe(request, pk):
     v = get_object_or_404(Veiculo, pk=pk)
     if request.method == "GET":
         return JsonResponse(_veiculo(v))
+
+    negado = _negar_se_nao_coseg(request)
+    if negado is not None:
+        return negado
     if request.method == "PUT":
         dados = _json(request)
         if dados is None:
@@ -78,13 +157,18 @@ def veiculo_detalhe(request, pk):
 
 
 # ---------- RESERVAS ----------
-@csrf_exempt
+@login_obrigatorio
 @require_http_methods(["GET", "POST"])
 def reservas_lista(request):
     if request.method == "GET":
-        qs = Reserva.objects.select_related("veiculo")
+        qs = Reserva.objects.select_related("veiculo", "criado_por")
+        if not request.user.is_staff:
+            qs = qs.filter(criado_por=request.user)
         if request.GET.get("data"):
-            qs = qs.filter(data=request.GET["data"])
+            try:
+                qs = qs.filter(data=DateField().clean(request.GET["data"]))
+            except ValidationError:
+                return _erro("Data inválida. Use o formato AAAA-MM-DD.")
         if request.GET.get("veiculo"):
             qs = qs.filter(veiculo__codigo=request.GET["veiculo"])
         return JsonResponse({"reservas": [_reserva(r) for r in qs]})
@@ -95,14 +179,20 @@ def reservas_lista(request):
     form = ReservaForm(dados)
     if not form.is_valid():
         return _erro("Não foi possível registrar a reserva.", erros=form.errors.get_json_data())
-    r = form.save()
+    r = form.save(commit=False)
+    r.criado_por = request.user
+    r.save()
     return JsonResponse({"sucesso": True, "mensagem": "Reserva registrada com sucesso.", "reserva": _reserva(r)}, status=201)
 
 
-@csrf_exempt
+@login_obrigatorio
 @require_http_methods(["GET", "PUT", "DELETE"])
 def reserva_detalhe(request, pk):
-    r = get_object_or_404(Reserva, pk=pk)
+    r = get_object_or_404(Reserva.objects.select_related("veiculo", "criado_por"), pk=pk)
+    negado = _negar_se_alheia(request, r)
+    if negado is not None:
+        return negado
+
     if request.method == "GET":
         return JsonResponse(_reserva(r))
     if request.method == "PUT":
@@ -113,20 +203,27 @@ def reserva_detalhe(request, pk):
         if not form.is_valid():
             return _erro("Não foi possível atualizar a reserva.", erros=form.errors.get_json_data())
         return JsonResponse({"sucesso": True, "mensagem": "Reserva atualizada.", "reserva": _reserva(form.save())})
+
+    if not request.user.is_staff:
+        return _erro("Somente o COSEG exclui reservas. Use /cancelar/.", status=403)
     r.delete()
     return JsonResponse({"sucesso": True, "mensagem": "Reserva excluída."})
 
 
-@csrf_exempt
+@login_obrigatorio
 @require_http_methods(["POST"])
 def reserva_cancelar(request, pk):
     r = get_object_or_404(Reserva, pk=pk)
+    negado = _negar_se_alheia(request, r)
+    if negado is not None:
+        return negado
     r.status = Reserva.Status.CANCELADA
     r.save()
     return JsonResponse({"sucesso": True, "mensagem": "Reserva cancelada; veículo liberado."})
 
 
-# ---------- DISPONIBILIDADE (ajuda o front do PBL 2) ----------
+# ---------- DISPONIBILIDADE ----------
+@login_obrigatorio
 @require_http_methods(["GET"])
 def disponibilidade(request):
     try:
@@ -134,7 +231,7 @@ def disponibilidade(request):
         saida = TimeField().clean(request.GET.get("saida"))
         retorno = TimeField().clean(request.GET.get("retorno"))
         pax = IntegerField(min_value=1).clean(request.GET.get("passageiros"))
-    except Exception:
+    except ValidationError:
         return _erro("Informe data, saida, retorno e passageiros válidos.")
     if retorno <= saida:
         return _erro("O horário de retorno deve ser posterior ao de saída.")

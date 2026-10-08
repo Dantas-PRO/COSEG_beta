@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 
 CAPACIDADES = {"LEVE": 4, "COLETIVO": 18}
 
@@ -43,6 +44,10 @@ class Reserva(models.Model):
     observacoes = models.TextField(blank=True)
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.ATIVA)
     criado_em = models.DateTimeField(auto_now_add=True)
+    criado_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="reservas",
+    )
 
     class Meta:
         ordering = ["data", "hora_saida"]
